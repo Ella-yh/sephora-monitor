@@ -1,10 +1,5 @@
 """
 sephora_monitor.py - 세포라 품절/재입고 모니터링 → Slack 알림
-Playwright Stealth 버전 (봇 감지 우회)
-
-사용법:
-  python sephora_monitor.py        # 1회 실행
-  python sephora_monitor.py --loop # 반복 실행
 """
 
 import csv, json, logging, os, time, argparse
@@ -15,14 +10,19 @@ import requests
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
+# playwright-stealth v1/v2 모두 지원
 try:
     from playwright_stealth import stealth_sync
-    STEALTH_AVAILABLE = True
+    STEALTH_MODE = "v1"
 except ImportError:
-    STEALTH_AVAILABLE = False
+    try:
+        from playwright_stealth import Stealth
+        STEALTH_MODE = "v2"
+    except ImportError:
+        STEALTH_MODE = None
 
 # ─────────────────────────────────────────
-# 설정 로드
+# 설정
 # ─────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / "config.env")
@@ -47,8 +47,7 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
-if not STEALTH_AVAILABLE:
-    logger.warning("playwright-stealth 미설치. 'pip install playwright-stealth' 권장")
+logger.info(f"Stealth 모드: {STEALTH_MODE or '미사용'}")
 
 # ─────────────────────────────────────────
 # 상태 파일
@@ -69,13 +68,12 @@ def save_state(state: dict) -> None:
 def load_products() -> list:
     products = []
     with open(PRODUCTS_CSV, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             url  = row.get("url", "").strip().strip("\r\n").strip()
             name = row.get("product_name", "").strip()
             if url and name:
                 products.append({"product_name": name, "url": url})
-    logger.info(f"제품 {len(products)}개 로드 완료")
+    logger.info(f"제품 {len(products)}개 로드")
     return products
 
 # ─────────────────────────────────────────
@@ -83,56 +81,59 @@ def load_products() -> list:
 # ─────────────────────────────────────────
 def check_stock_status(page, url: str) -> tuple:
     try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(2000)
+        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        # React 렌더링 완료 대기
+        page.wait_for_timeout(5000)
     except PlaywrightTimeout:
-        # networkidle 타임아웃은 종종 정상 - domcontentloaded로 재시도
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(3000)
-        except Exception as e:
-            return "unknown", f"timeout: {e}"
+        return "unknown", "timeout"
     except Exception as e:
         return "unknown", str(e)
 
     # 페이지 내용 확인
     try:
         body_text = page.inner_text("body").strip()
-        if len(body_text) < 100:
-            return "unknown", f"empty page (len={len(body_text)})"
-    except Exception:
-        pass
+        body_len  = len(body_text)
+        # 디버그: 페이지 내용 일부 출력
+        snippet = body_text[:200].replace("\n", " ")
+        logger.info(f"  페이지 길이={body_len}, 미리보기: {snippet}")
 
-    # ── 1순위: OUT OF STOCK 뱃지 텍스트 ──────────────────────────
-    try:
-        full_text = page.inner_text("body").lower()
-        if "out of stock" in full_text:
-            # Add to Basket도 있으면 → 다른 사이즈가 재고 있음
-            # URL에 skuId가 있으면 해당 사이즈만 체크
-            if "?skuid=" in url.lower() or "?skupid=" in url.lower():
-                # 특정 사이즈 URL → 그 사이즈의 상태만 신뢰
-                # 선택된 버튼 근처의 OOS 여부 확인
-                size_area = page.query_selector("[class*='VariantPicker'], [class*='variantPicker'], [data-comp*='VariantSelect']")
-                if size_area:
-                    size_text = (size_area.inner_text() or "").lower()
-                    if "out of stock" in size_text:
-                        return "out_of_stock", "size area: out of stock"
-                # skuId URL에서 페이지 상단 뱃지 확인
-                badge = page.query_selector("[class*='badge'][class*='outOfStock'], [class*='Badge'][class*='OutOfStock']")
-                if badge:
-                    return "out_of_stock", f"badge: {badge.inner_text()[:40]}"
-                # "Size: X oz | OUT OF STOCK" 패턴
-                if "size:" in full_text and "out of stock" in full_text:
-                    return "out_of_stock", "size label: out of stock"
-            else:
-                # 기본 URL → 현재 보이는 사이즈 기준
-                if "size:" in full_text and "out of stock" in full_text:
-                    return "out_of_stock", "size label: out of stock"
-    except Exception as e:
-        logger.debug(f"텍스트 탐지 오류: {e}")
+        if body_len < 200:
+            return "unknown", f"empty/blocked page (len={body_len})"
 
-    # ── 2순위: JSON-LD ────────────────────────────────────────────
-    try:
+        text_lower = body_text.lower()
+
+        # ── OUT OF STOCK 텍스트 감지 ──────────────────────────────
+        if "out of stock" in text_lower:
+            # Add to Basket도 있는지 확인 (다른 사이즈는 재고 있을 수 있음)
+            if "add to basket" in text_lower or "add to bag" in text_lower:
+                # skuId URL이면 해당 사이즈가 OOS
+                if "skuid" in url.lower():
+                    return "out_of_stock", "OUT OF STOCK (specific sku)"
+                # skuId 없는 URL: 기본 사이즈 OOS 여부 확인
+                # 제목 바로 옆에 OOS 뱃지가 있는 경우
+                try:
+                    badge = page.query_selector("b:has-text('OUT OF STOCK'), span:has-text('OUT OF STOCK'), div:has-text('OUT OF STOCK')")
+                    if badge:
+                        return "out_of_stock", f"OOS badge found"
+                except Exception:
+                    pass
+                return "in_stock", "has Add to Basket (some sizes in stock)"
+            return "out_of_stock", "OUT OF STOCK (no add to basket)"
+
+        # ── Add to Basket 버튼 확인 ──────────────────────────────
+        if "add to basket" in text_lower or "add to bag" in text_lower:
+            try:
+                btn = page.query_selector("button:has-text('Add to Basket'), button:has-text('Add to Bag')")
+                if btn:
+                    disabled = btn.get_attribute("disabled")
+                    if disabled is not None:
+                        return "out_of_stock", "Add to Basket disabled"
+                    return "in_stock", "Add to Basket enabled"
+            except Exception:
+                pass
+            return "in_stock", "Add to Basket text found"
+
+        # ── JSON-LD fallback ──────────────────────────────────────
         for script in page.query_selector_all("script[type='application/ld+json']"):
             try:
                 data = json.loads(script.inner_text())
@@ -143,39 +144,14 @@ def check_stock_status(page, url: str) -> tuple:
                         offers = offers[0] if offers else {}
                     avail = offers.get("availability", "")
                     if "OutOfStock" in avail:
-                        return "out_of_stock", f"JSON-LD: {avail}"
+                        return "out_of_stock", f"JSON-LD: OutOfStock"
                     if "InStock" in avail:
-                        return "in_stock", f"JSON-LD: {avail}"
+                        return "in_stock", f"JSON-LD: InStock"
             except Exception:
                 continue
-    except Exception:
-        pass
 
-    # ── 3순위: Add to Basket 버튼 상태 ───────────────────────────
-    try:
-        add_btn = page.query_selector(
-            "button:has-text('Add to Basket'), "
-            "button:has-text('Add to Bag'), "
-            "button:has-text('Add to Cart')"
-        )
-        if add_btn:
-            disabled = add_btn.get_attribute("disabled")
-            aria_disabled = add_btn.get_attribute("aria-disabled")
-            if disabled is not None or aria_disabled == "true":
-                return "out_of_stock", "Add to Basket disabled"
-            return "in_stock", "Add to Basket enabled"
-    except Exception:
-        pass
-
-    # ── 4순위: 전체 텍스트 fallback ──────────────────────────────
-    try:
-        full_text = page.inner_text("body").lower()
-        if "out of stock" in full_text:
-            return "out_of_stock", "page text: out of stock"
-        if "add to basket" in full_text or "add to bag" in full_text:
-            return "in_stock", "page text: add to basket"
-    except Exception:
-        pass
+    except Exception as e:
+        return "unknown", f"error: {e}"
 
     return "unknown", "status not detected"
 
@@ -206,7 +182,7 @@ def send_slack_alert(product_name: str, url: str, event: str) -> bool:
     }
     try:
         requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10).raise_for_status()
-        logger.info(f"Slack 알림 전송: [{label}] {product_name}")
+        logger.info(f"Slack 전송 성공: [{label}] {product_name}")
         return True
     except Exception as e:
         logger.error(f"Slack 전송 실패: {e}")
@@ -222,7 +198,11 @@ def run_check() -> None:
     state    = load_state()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-blink-features=AutomationControlled"]
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -235,10 +215,17 @@ def run_check() -> None:
         )
         page = context.new_page()
 
-        # stealth 적용
-        if STEALTH_AVAILABLE:
+        # Stealth 적용
+        if STEALTH_MODE == "v1":
             stealth_sync(page)
-            logger.info("Stealth 모드 활성화")
+        elif STEALTH_MODE == "v2":
+            Stealth().apply_stealth_sync(page)
+
+        # 자동화 감지 숨기기
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+        """)
 
         for product in products:
             name = product["product_name"]
@@ -255,10 +242,10 @@ def run_check() -> None:
             elif prev is None:
                 logger.info(f"  → 최초 등록 (현재: {new_status})")
             elif prev == "in_stock" and new_status == "out_of_stock":
-                logger.info(f"  → 🔴 품절 감지! Slack 전송")
+                logger.info(f"  → 🔴 품절 감지!")
                 send_slack_alert(name, url, "out_of_stock")
             elif prev == "out_of_stock" and new_status == "in_stock":
-                logger.info(f"  → 🟢 재입고 감지! Slack 전송")
+                logger.info(f"  → 🟢 재입고 감지!")
                 send_slack_alert(name, url, "back_in_stock")
             else:
                 logger.info(f"  → 변화 없음 ({prev})")
