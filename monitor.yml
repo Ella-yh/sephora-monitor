@@ -1,0 +1,33 @@
+name: Sephora Stock Monitor
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 매 1시간마다 실행 (UTC 기준)
+  workflow_dispatch:        # 수동 실행 버튼
+
+jobs:
+  check-stock:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 패키지 설치
+        run: |
+          pip install -r requirements.txt
+          pip install playwright-stealth
+
+      - name: Playwright 브라우저 설치
+        run: python -m playwright install chromium --with-deps
+
+      - name: 품절 모니터링 실행
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+        run: python sephora_monitor.py
